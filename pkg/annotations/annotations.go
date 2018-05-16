@@ -50,6 +50,7 @@ const (
 	albRoleTagKey                 = "tag:kubernetes.io/role/alb-ingress"
 	albManagedSubnetsCacheKey     = "alb-managed-subnets"
 	attributesKey                 = "alb.ingress.kubernetes.io/attributes"
+	existingAlbTagKey             = "alb.ingress.kubernetes.io/existing-alb-tag"
 )
 
 // Annotations contains all of the annotation configuration for an ingress
@@ -76,6 +77,7 @@ type Annotations struct {
 	IgnoreHostHeader           *bool
 	VPCID                      *string
 	Attributes                 []*elbv2.LoadBalancerAttribute
+	ExistingAlbTag             *elbv2.Tag
 }
 
 type PortData struct {
@@ -105,7 +107,7 @@ func (vf ValidatingAnnotationFactory) ParseAnnotations(ingress *extensions.Ingre
 	ingressName := ingress.Name
 	clusterName := ingress.ClusterName
 	if annotations == nil {
-		return nil, fmt.Errorf("Necessary annotations missing. Must include at least %s, %s, %s", subnetsKey, securityGroupsKey, schemeKey)
+		return nil, fmt.Errorf("Necessary annotations missing. Must include at least (%s, %s, %s) or %s", subnetsKey, securityGroupsKey, schemeKey, existingAlbTagKey)
 	}
 
 	sortedAnnotations := util.SortedMap(annotations)
@@ -138,6 +140,7 @@ func (vf ValidatingAnnotationFactory) ParseAnnotations(ingress *extensions.Ingre
 		a.setIgnoreHostHeader(annotations),
 		a.setWafAclId(annotations, vf.validator),
 		a.setAttributes(annotations),
+		a.setExistingAlbTag(annotations),
 	} {
 		if err != nil {
 			cache.Set(cacheKey, err, 1*time.Hour)
@@ -148,6 +151,10 @@ func (vf ValidatingAnnotationFactory) ParseAnnotations(ingress *extensions.Ingre
 }
 
 func (a *Annotations) setAttributes(annotations map[string]string) error {
+	err := isUsingExistingAlb(annotations, attributesKey)
+	if err != nil {
+		return err
+	}
 	var attrs []*elbv2.LoadBalancerAttribute
 	var badAttrs []string
 	rawAttrs := util.NewAWSStringSlice(annotations[attributesKey])
@@ -197,6 +204,10 @@ func (a *Annotations) setCertificateArn(annotations map[string]string, validator
 }
 
 func (a *Annotations) setConnectionIdleTimeout(annotations map[string]string) error {
+	err := isUsingExistingAlb(annotations, connectionIdleTimeoutKey)
+	if err != nil {
+		return err
+	}
 	i, err := strconv.ParseInt(annotations[connectionIdleTimeoutKey], 10, 64)
 	if err != nil {
 		if annotations[connectionIdleTimeoutKey] != "" {
@@ -345,6 +356,10 @@ func (a *Annotations) setPorts(annotations map[string]string) error {
 }
 
 func (a *Annotations) setInboundCidrs(annotations map[string]string, validator Validator) error {
+	err := isUsingExistingAlb(annotations, inboundCidrsKey)
+	if err != nil {
+		return err
+	}
 	for _, inboundCidr := range util.NewAWSStringSlice(annotations[inboundCidrsKey]) {
 		a.InboundCidrs = append(a.InboundCidrs, inboundCidr)
 		if err := validator.ValidateInboundCidrs(a); err != nil {
@@ -356,6 +371,10 @@ func (a *Annotations) setInboundCidrs(annotations map[string]string, validator V
 }
 
 func (a *Annotations) setScheme(annotations map[string]string, ingressNamespace, ingressName string, validator Validator) error {
+	err := isUsingExistingAlb(annotations, schemeKey)
+	if err != nil {
+		return err
+	}
 	switch {
 	case annotations[schemeKey] == "":
 		return fmt.Errorf(`Necessary annotations missing. Must include %s`, schemeKey)
@@ -378,6 +397,10 @@ func (a *Annotations) setScheme(annotations map[string]string, ingressNamespace,
 }
 
 func (a *Annotations) setIpAddressType(annotations map[string]string) error {
+	err := isUsingExistingAlb(annotations, ipAddressTypeKey)
+	if err != nil {
+		return err
+	}
 	switch {
 	case annotations[ipAddressTypeKey] == "":
 		a.IpAddressType = aws.String("ipv4")
@@ -390,6 +413,10 @@ func (a *Annotations) setIpAddressType(annotations map[string]string) error {
 }
 
 func (a *Annotations) setSecurityGroups(annotations map[string]string, validator Validator) error {
+	err := isUsingExistingAlb(annotations, securityGroupsKey)
+	if err != nil {
+		return err
+	}
 	// no security groups specified means controller should manage them, if so return and sg will be
 	// created and managed during reconcile.
 	if _, ok := annotations[securityGroupsKey]; !ok {
@@ -470,6 +497,10 @@ func (a *Annotations) setSecurityGroups(annotations map[string]string, validator
 }
 
 func (a *Annotations) setSubnets(annotations map[string]string, clusterName string, validator Validator) error {
+	err := isUsingExistingAlb(annotations, subnetsKey)
+	if err != nil {
+		return err
+	}
 	var names []*string
 	var out util.AWSStringSlice
 
@@ -620,6 +651,10 @@ func (a *Annotations) setSuccessCodes(annotations map[string]string) error {
 }
 
 func (a *Annotations) setTags(annotations map[string]string) error {
+	err := isUsingExistingAlb(annotations, tagsKey)
+	if err != nil {
+		return err
+	}
 	var tags []*elbv2.Tag
 	var badTags []string
 	rawTags := util.NewAWSStringSlice(annotations[tagsKey])
@@ -656,6 +691,10 @@ func (a *Annotations) setIgnoreHostHeader(annotations map[string]string) error {
 }
 
 func (a *Annotations) setWafAclId(annotations map[string]string, validator Validator) error {
+	err := isUsingExistingAlb(annotations, wafAclIdKey)
+	if err != nil {
+		return err
+	}
 	if waf_acl_id, ok := annotations[wafAclIdKey]; ok {
 		a.WafAclId = aws.String(waf_acl_id)
 		if c := cacheLookup(waf_acl_id); c == nil || c.Expired() {
@@ -664,6 +703,33 @@ func (a *Annotations) setWafAclId(annotations map[string]string, validator Valid
 				return err
 			}
 			cache.Set(waf_acl_id, "success", 30*time.Minute)
+		}
+	}
+	return nil
+}
+
+func (a *Annotations) setExistingAlbTag(annotations map[string]string) error {
+	if tag, ok := annotations[existingAlbTagKey]; ok {
+		parts := strings.Split(tag, "=")
+		if len(parts) > 2 {
+			return fmt.Errorf("Unable to parse `%s` into a single Key=Value pair", tag)
+		}
+		tagValue := ""
+		if len(parts) > 1 {
+			tagValue = parts[1]
+		}
+		a.ExistingAlbTag = &elbv2.Tag{
+			Key: aws.String(parts[0]),
+			Value: aws.String(tagValue),
+		}
+	}
+	return nil
+}
+
+func isUsingExistingAlb(annotations map[string]string, mutuallyExclusiveKey string) error {
+	if tag, ok := annotations[existingAlbTagKey]; ok {
+		if _, ok2 := annotations[mutuallyExclusiveKey]; ok2 {
+			return fmt.Errorf("Cannot use an existing ALB with tag-value %s with annotation %s", tag, mutuallyExclusiveKey)
 		}
 	}
 	return nil

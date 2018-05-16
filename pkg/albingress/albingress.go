@@ -369,6 +369,22 @@ func (a *ALBIngress) Tags() []*elbv2.Tag {
 		Value: aws.String(a.ingressName),
 	})
 
+	tags = append(tags, &elbv2.Tag{
+		Key: aws.String("KubernetesCluster"),
+		Value: aws.String(a.clusterName),
+	})
+
+	// TODO Is there a k8s-defined schema for these tag keys?
+	if a.annotations.ExistingAlbTag != nil {
+		tags = append(tags, &elbv2.Tag{
+			Key: aws.String("alb-ingress-controller/ExistingAlb/Tag/Key"),
+			Value: aws.String(*a.annotations.ExistingAlbTag.Key),
+		})
+		tags = append(tags, &elbv2.Tag{
+			Key: aws.String("alb-ingress-controller/ExistingAlb/Tag/Value"),
+			Value: aws.String(*a.annotations.ExistingAlbTag.Value),
+		})
+	}
 	return tags
 }
 

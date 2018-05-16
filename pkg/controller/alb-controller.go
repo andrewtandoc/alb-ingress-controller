@@ -163,6 +163,7 @@ func syncALBsWithAWS(ac *albController) {
 	ac.ALBIngresses = albingresses.AssembleIngressesFromAWS(&albingresses.AssembleIngressesFromAWSOptions{
 		Recorder:      ac.recorder,
 		ALBNamePrefix: ac.albNamePrefix,
+		ClusterName:   &ac.clusterName,
 	})
 }
 
@@ -227,7 +228,7 @@ func (ac *albController) update() {
 
 	// clean up all deleted ingresses from the list
 	for _, ingress := range ac.ALBIngresses {
-		if ingress.LoadBalancer != nil && ingress.LoadBalancer.Deleted {
+		if ingress.LoadBalancer != nil && ingress.LoadBalancer.EffectivelyDeleted {
 			i, _ := ac.ALBIngresses.FindByID(ingress.ID)
 			ac.ALBIngresses = append(ac.ALBIngresses[:i], ac.ALBIngresses[i+1:]...)
 			albprom.ManagedIngresses.With(

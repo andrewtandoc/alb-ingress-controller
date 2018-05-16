@@ -25,21 +25,28 @@ const (
 	deleteTargetGroupReattemptSleep int = 10
 	// Maximum attempts should be made to delete a target group
 	deleteTargetGroupReattemptMax int = 10
+	// Maximum number of resources to specify for DescribeTags
+	describeTagsMaxResources int = 20
+	// Type of load balancer needed by this controller
+	expectedLoadBalancerType = "application"
 )
 
 type ELBV2API interface {
 	elbv2iface.ELBV2API
-	ClusterLoadBalancers(clusterName *string) ([]*elbv2.LoadBalancer, error)
+	ClusterLoadBalancers(albNamePrefix, clusterName *string) ([]*elbv2.LoadBalancer, error)
 	SetIdleTimeout(arn *string, timeout int64) error
 	UpdateTags(arn *string, old util.Tags, new util.Tags) error
 	UpdateAttributes(arn *string, new []*elbv2.LoadBalancerAttribute) error
 	RemoveTargetGroup(in elbv2.DeleteTargetGroupInput) error
 	DescribeTagsForArn(arn *string) (util.Tags, error)
+	DescribeTagsForArns(arns []*string) (map[string]util.Tags, error)
 	DescribeTargetGroupTargetsForArn(arn *string, targets []*elbv2.TargetDescription) (util.AWSStringSlice, error)
 	RemoveListener(in elbv2.DeleteListenerInput) error
 	DescribeTargetGroupsForLoadBalancer(loadBalancerArn *string) ([]*elbv2.TargetGroup, error)
 	DescribeListenersForLoadBalancer(loadBalancerArn *string) ([]*elbv2.Listener, error)
 	Status() func() error
+	DescribeAlbsWithTags([]*elbv2.Tag) ([]*elbv2.LoadBalancer, error)
+	DeleteListenersForLoadBalancerArn(*string, []int64) error
 }
 
 type AttributesAPI interface {
@@ -124,8 +131,9 @@ func (e *ELBV2) RemoveTargetGroup(in elbv2.DeleteTargetGroupInput) error {
 }
 
 // ClusterLoadBalancers looks up all ELBV2 (ALB) instances in AWS that are part of the cluster.
-func (e *ELBV2) ClusterLoadBalancers(clusterName *string) ([]*elbv2.LoadBalancer, error) {
-	var loadbalancers []*elbv2.LoadBalancer
+func (e *ELBV2) ClusterLoadBalancers(albNamePrefix, clusterName *string) ([]*elbv2.LoadBalancer, error) {
+	var managedLoadBalancers []*elbv2.LoadBalancer
+	var unmanagedLoadBalancers []*elbv2.LoadBalancer
 
 	err := e.DescribeLoadBalancersPagesWithContext(context.Background(),
 		&elbv2.DescribeLoadBalancersInput{},
@@ -134,9 +142,11 @@ func (e *ELBV2) ClusterLoadBalancers(clusterName *string) ([]*elbv2.LoadBalancer
 				if strings.HasPrefix(*loadBalancer.LoadBalancerName, *clusterName+"-") {
 					if s := strings.Split(*loadBalancer.LoadBalancerName, "-"); len(s) >= 2 {
 						if s[0] == *clusterName {
-							loadbalancers = append(loadbalancers, loadBalancer)
+							managedLoadBalancers = append(managedLoadBalancers, loadBalancer)
 						}
 					}
+				} else {
+					unmanagedLoadBalancers = append(unmanagedLoadBalancers, loadBalancer)
 				}
 			}
 			return true
@@ -145,7 +155,8 @@ func (e *ELBV2) ClusterLoadBalancers(clusterName *string) ([]*elbv2.LoadBalancer
 		return nil, err
 	}
 
-	return loadbalancers, nil
+	// TODO Fetch all load balancers with cluster name tag
+	return managedLoadBalancers, nil
 }
 
 // DescribeTargetGroupsForLoadBalancer looks up all ELBV2 (ALB) target groups in AWS that are part of the cluster.
@@ -202,6 +213,30 @@ func (e *ELBV2) DescribeTagsForArn(arn *string) (util.Tags, error) {
 	}
 
 	return tags, err
+}
+
+func (e *ELBV2) DescribeTagsForArns(arns []*string) (map[string]util.Tags, error) {
+	var arnTagsMap map[string]util.Tags
+	for i := 0; i < len(arns); i += describeTagsMaxResources {
+		limit := i + describeTagsMaxResources
+		if limit > len(arns) {
+			limit = len(arns)
+		}
+		describeTags, err := e.DescribeTags(&elbv2.DescribeTagsInput{
+			ResourceArns: arns[i:limit],
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, tagDescription := range describeTags.TagDescriptions {
+			arnTagsMap[*tagDescription.ResourceArn] = tagDescription.Tags
+		}
+	}
+
+	if len(arns) != len(arnTagsMap) {
+		return nil, fmt.Errorf("List of resources returned does not match input, Input: %s, Output: %s", arns, arnTagsMap)
+	}
+	return arnTagsMap, nil
 }
 
 // DescribeTargetGroupTargetsForArn looks up target group targets by an ARN.
@@ -318,4 +353,72 @@ func (e *ELBV2) UpdateAttributes(arn *string, attributes []*elbv2.LoadBalancerAt
 	}
 	_, err := e.ModifyLoadBalancerAttributes(newAttributes)
 	return err
+}
+
+func (e *ELBV2) DescribeAlbsWithTags(expectedTags []*elbv2.Tag) ([]*elbv2.LoadBalancer, error) {
+	// Fetch all application load balancers
+	loadBalancers := make(map[string]*elbv2.LoadBalancer)
+	err := e.DescribeLoadBalancersPagesWithContext(context.Background(),
+		&elbv2.DescribeLoadBalancersInput{},
+		func(p *elbv2.DescribeLoadBalancersOutput, lastPage bool) bool {
+			for _, loadBalancer := range p.LoadBalancers {
+				if (*loadBalancer.Type == expectedLoadBalancerType) {
+					loadBalancers[*loadBalancer.LoadBalancerArn] = loadBalancer
+				}
+			}
+			return true
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch all tags for all application load balancers
+	arns := make([]*string, len(loadBalancers))
+	i := 0
+	for arn, _:= range loadBalancers {
+		arns[i] = &arn
+		i++
+	}
+	arnTagsMap, err := e.DescribeTagsForArns(arns)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find all load balancers with expected tags
+	loadBalancersWithExpectedTags := []*elbv2.LoadBalancer{}
+	for taggedArn, tagList := range arnTagsMap {
+		for _, tag := range tagList {
+			foundTags := 0
+			for _, expectedTag := range expectedTags {
+				if expectedTag.Key == tag.Key && expectedTag.Value == tag.Value {
+					foundTags++
+				}
+			}
+			if foundTags == len(expectedTags) {
+				loadBalancersWithExpectedTags = append(loadBalancersWithExpectedTags, loadBalancers[taggedArn])
+			}
+		}
+	}
+
+	return loadBalancersWithExpectedTags, nil
+}
+
+func (e *ELBV2) DeleteListenersForLoadBalancerArn(loadBalancerArn *string, ports []int64) error {
+	listeners, err := e.DescribeListenersForLoadBalancer(loadBalancerArn)
+	if err != nil {
+		return err
+	}
+	for _, port := range ports {
+		for _, listener := range listeners {
+			if port == *listener.Port {
+				err = e.RemoveListener(elbv2.DeleteListenerInput{
+					ListenerArn: listener.ListenerArn,
+				})
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }

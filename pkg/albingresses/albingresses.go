@@ -83,6 +83,7 @@ func NewALBIngressesFromIngresses(o *NewALBIngressesFromIngressesOptions, annota
 type AssembleIngressesFromAWSOptions struct {
 	Recorder      record.EventRecorder
 	ALBNamePrefix string
+	ClusterName  *string
 }
 
 // AssembleIngressesFromAWS builds a list of existing ingresses from resources in AWS
@@ -94,7 +95,7 @@ func AssembleIngressesFromAWS(o *AssembleIngressesFromAWSOptions) ALBIngresses {
 	t0 := time.Now()
 
 	// Fetch a list of load balancers that match this cluser name
-	loadBalancers, err := albelbv2.ELBV2svc.ClusterLoadBalancers(&o.ALBNamePrefix)
+	loadBalancers, err := albelbv2.ELBV2svc.ClusterLoadBalancers(&o.ALBNamePrefix, o.ClusterName)
 	if err != nil {
 		logger.Fatalf(err.Error())
 	}

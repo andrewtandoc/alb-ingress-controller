@@ -32,6 +32,7 @@ func (ls Listeners) Find(l *elbv2.Listener) int {
 
 // Reconcile kicks off the state synchronization for every Listener in this Listeners instances.
 // TODO: function has changed a lot, test
+// TODO (2018-05-15): Precondition check, ensure any new ports are disjoint with lb.UnmanagedPorts
 func (ls Listeners) Reconcile(rOpts *ReconcileOptions) (Listeners, error) {
 	output := Listeners{}
 	if len(ls) < 1 {

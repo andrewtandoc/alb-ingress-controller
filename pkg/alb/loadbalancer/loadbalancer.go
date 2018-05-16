@@ -22,6 +22,8 @@ import (
 	"github.com/coreos/alb-ingress-controller/pkg/util/log"
 	util "github.com/coreos/alb-ingress-controller/pkg/util/types"
 	api "k8s.io/api/core/v1"
+	"strings"
+	"strconv"
 )
 
 // LoadBalancer contains the overarching configuration for the ALB
@@ -39,6 +41,7 @@ type LoadBalancer struct {
 	DesiredAttributes        []*elbv2.LoadBalancerAttribute
 	CurrentPorts             portList
 	DesiredPorts             portList
+	UnmanagedPorts           portList
 	CurrentInboundCidrs      util.Cidrs
 	DesiredInboundCidrs      util.Cidrs
 	CurrentWafAcl            *string
@@ -47,7 +50,9 @@ type LoadBalancer struct {
 	DesiredManagedSG         *string
 	CurrentManagedInstanceSG *string
 	DesiredManagedInstanceSG *string
-	Deleted                  bool // flag representing the LoadBalancer instance was fully deleted.
+	EffectivelyDeleted       bool // flag representing the LoadBalancer instance was fully deleted (or cleaned up)
+	ExistingAlbTag           *elbv2.Tag
+	ClusterName              *string
 	logger                   *log.Logger
 }
 
@@ -74,6 +79,7 @@ type NewDesiredLoadBalancerOptions struct {
 	Annotations          *annotations.Annotations
 	Tags                 util.Tags
 	Attributes           []*elbv2.LoadBalancerAttribute
+	ExistingAlbTag       *elbv2.Tag
 }
 
 type portList []int64
@@ -100,6 +106,7 @@ func NewDesiredLoadBalancer(o *NewDesiredLoadBalancerOptions) *LoadBalancer {
 			SecurityGroups:    o.Annotations.SecurityGroups,
 			VpcId:             o.Annotations.VPCID,
 		},
+		ExistingAlbTag:     o.ExistingAlbTag,
 		logger: o.Logger,
 	}
 
@@ -163,6 +170,8 @@ func NewCurrentLoadBalancer(o *NewCurrentLoadBalancerOptions) (*LoadBalancer, er
 	if name != *o.LoadBalancer.LoadBalancerName {
 		return nil, fmt.Errorf("Loadbalancer does not have expected (calculated) name. "+
 			"Expecting %s but was %s.", name, *o.LoadBalancer.LoadBalancerName)
+	} else {
+		// TODO Handle unmanaged ALBs with tags
 	}
 
 	return &LoadBalancer{
@@ -190,27 +199,44 @@ func (lb *LoadBalancer) Reconcile(rOpts *ReconcileOptions) []error {
 		if lb.Current == nil {
 			break
 		}
-		lb.logger.Infof("Start ELBV2 (ALB) deletion.")
-		if err := lb.delete(rOpts); err != nil {
-			errors = append(errors, err)
-			break
+		if lb.ExistingAlbTag == nil {
+			lb.logger.Infof("Start ELBV2 (ALB) deletion.")
+			if err := lb.delete(rOpts); err != nil {
+				errors = append(errors, err)
+				break
+			}
+			rOpts.Eventf(api.EventTypeNormal, "DELETE", "%s deleted", *lb.Current.LoadBalancerName)
+			lb.logger.Infof("Completed ELBV2 (ALB) deletion. Name: %s | ARN: %s",
+				*lb.Current.LoadBalancerName,
+				*lb.Current.LoadBalancerArn)
+		} else {
+			lb.logger.Infof("ALB (%s) was created outside of this controller, removing controller-added tags (%s) and listeners only", lb.Current.LoadBalancerArn, lb.DesiredTags)
+			if err := lb.clearIngressFromLoadBalancer(rOpts); err != nil {
+				errors = append(errors, err)
+			}
+			rOpts.Eventf(api.EventTypeNormal, "DELETE", "ALB (%s), stripped of controller-added tags and listeners", *lb.Current.LoadBalancerName)
+			lb.logger.Infof("Completed ELBV2 (ALB) deletion. Name: %s | ARN: %s",
+				*lb.Current.LoadBalancerName,
+				*lb.Current.LoadBalancerArn)
 		}
-		rOpts.Eventf(api.EventTypeNormal, "DELETE", "%s deleted", *lb.Current.LoadBalancerName)
-		lb.logger.Infof("Completed ELBV2 (ALB) deletion. Name: %s | ARN: %s",
-			*lb.Current.LoadBalancerName,
-			*lb.Current.LoadBalancerArn)
-
 	case lb.Current == nil: // lb doesn't exist and should be created
-		lb.logger.Infof("Start ELBV2 (ALB) creation.")
-		if err := lb.create(rOpts); err != nil {
-			errors = append(errors, err)
-			return errors
+		if lb.ExistingAlbTag == nil {
+			lb.logger.Infof("Start ELBV2 (ALB) creation.")
+			if err := lb.create(rOpts); err != nil {
+				errors = append(errors, err)
+				return errors
+			}
+			rOpts.Eventf(api.EventTypeNormal, "CREATE", "%s created", *lb.Current.LoadBalancerName)
+			lb.logger.Infof("Completed ELBV2 (ALB) creation. Name: %s | ARN: %s",
+				*lb.Current.LoadBalancerName,
+				*lb.Current.LoadBalancerArn)
+		} else {
+			lb.logger.Infof("Using existing ALB with tag: %s")
+			if err := lb.useExistingTaggedLoadBalancer(rOpts); err != nil {
+				errors = append(errors, err)
+				return errors
+			}
 		}
-		rOpts.Eventf(api.EventTypeNormal, "CREATE", "%s created", *lb.Current.LoadBalancerName)
-		lb.logger.Infof("Completed ELBV2 (ALB) creation. Name: %s | ARN: %s",
-			*lb.Current.LoadBalancerName,
-			*lb.Current.LoadBalancerArn)
-
 	default: // check for diff between lb current and desired, modify if necessary
 		needsModification, _ := lb.needsModification()
 		if needsModification == 0 {
@@ -367,6 +393,7 @@ func (lb *LoadBalancer) create(rOpts *ReconcileOptions) error {
 
 	// lb created. set to current
 	lb.Current = o.LoadBalancers[0]
+	lb.CurrentTags = lb.DesiredTags
 
 	// DesiredIdleTimeout is 0 when no annotation was set, thus no modification should be attempted
 	// this will result in using the AWS default
@@ -604,7 +631,7 @@ func (lb *LoadBalancer) delete(rOpts *ReconcileOptions) error {
 
 	}
 
-	lb.Deleted = true
+	lb.EffectivelyDeleted = true
 	return nil
 }
 
@@ -745,4 +772,117 @@ func createLBName(namespace string, ingressName string, clustername string) stri
 	}
 	name = name + "-" + hash
 	return name
+}
+
+func (lb *LoadBalancer) useExistingTaggedLoadBalancer(rOpts *ReconcileOptions) error {
+	expectedTags := []*elbv2.Tag{
+		lb.ExistingAlbTag,
+		{Key:aws.String("KubernetesCluster"), Value: lb.ClusterName,},
+	}
+
+	taggedLoadBalancers, err := albelbv2.ELBV2svc.DescribeAlbsWithTags(expectedTags)
+
+	if err != nil {
+		rOpts.Eventf(api.EventTypeWarning, "ERROR", "Error using existing load balancer with tags %s: %s", expectedTags, err.Error())
+		lb.logger.Errorf("Failed to use existing load balancer with tags %s: %s", expectedTags, err.Error())
+		return err
+	}
+
+	if len(taggedLoadBalancers) == 0 {
+		rOpts.Eventf(api.EventTypeWarning, "ERROR", "Could not find existing load balancer with tags %s", expectedTags)
+		lb.logger.Errorf("Could not find existing load balancer with tags %s", expectedTags)
+		return fmt.Errorf("Could not find existing load balancer with tags %s", expectedTags)
+	}
+
+	if len(taggedLoadBalancers) > 1 {
+		rOpts.Eventf(api.EventTypeWarning, "ERROR", "Found multiple existing load balancers with tags %s: %s", expectedTags, taggedLoadBalancers)
+		lb.logger.Errorf("Found multiple existing load balancers with tags %s: %s", expectedTags, taggedLoadBalancers)
+		return fmt.Errorf("Found multiple existing load balancers with tags %s: %s", expectedTags, taggedLoadBalancers)
+	}
+
+	// TODO Perhaps throw error if name matches effective name for the equivalent fully-mananged ALB
+
+	matchingLoadBalancer := taggedLoadBalancers[0]
+
+	tags, err := albelbv2.ELBV2svc.DescribeTagsForArn(matchingLoadBalancer.LoadBalancerArn)
+	if err != nil {
+		// TODO Errors
+		return err
+	}
+
+	unmanagedPorts := []int64{}
+	for _, tag := range tags {
+		if *tag.Key == "alb-ingress-controller/ExistingAlb/UnmanagedPorts" {
+			ports := strings.Split(*tag.Value, ",")
+			for _, portStr := range ports {
+				port, err := strconv.ParseInt(portStr, 10, 64)
+				if err != nil {
+					// TODO Errors
+					return err
+				}
+				unmanagedPorts = append(unmanagedPorts, port)
+			}
+		}
+	}
+
+	desiredPortUnmanagedPortCollisions := []int64{}
+	for _, unmanangedPort := range unmanagedPorts {
+		for _, desiredPort := range lb.DesiredPorts {
+			if unmanangedPort == desiredPort {
+				desiredPortUnmanagedPortCollisions = append(desiredPortUnmanagedPortCollisions, unmanangedPort)
+			}
+		}
+	}
+
+	if len(desiredPortUnmanagedPortCollisions) > 0 {
+		rOpts.Eventf(api.EventTypeWarning, "ERROR", "Desired port(s) (%s) already in use (%s)", lb.DesiredPorts, desiredPortUnmanagedPortCollisions)
+		lb.logger.Errorf("Desired port(s) (%s) already in use (%s)", lb.DesiredPorts, desiredPortUnmanagedPortCollisions)
+		return fmt.Errorf("Desired port(s) (%s) already in use (%s)", lb.DesiredPorts, desiredPortUnmanagedPortCollisions)
+	}
+
+	_, err = albelbv2.ELBV2svc.AddTags(&elbv2.AddTagsInput{
+		ResourceArns: []*string{matchingLoadBalancer.LoadBalancerArn},
+		Tags: lb.DesiredTags,
+	})
+
+	if err != nil {
+		rOpts.Eventf(api.EventTypeWarning, "ERROR", "Failed to add desired tags (%s) to existing load balancer (%s): %s", lb.DesiredTags, matchingLoadBalancer.LoadBalancerArn, err.Error())
+		lb.logger.Errorf("Failed to add desired tags (%s) to existing load balancer (%s): %s", lb.DesiredTags, matchingLoadBalancer.LoadBalancerArn, err.Error())
+		return err
+	}
+
+	lb.Current = matchingLoadBalancer
+	lb.UnmanagedPorts = unmanagedPorts
+	lb.CurrentTags = lb.DesiredTags
+
+	return nil
+}
+
+func (lb *LoadBalancer) clearIngressFromLoadBalancer(rOpts *ReconcileOptions) error {
+	tagKeysToRemove := []*string{}
+	for _, tag := range lb.DesiredTags {
+		if *tag.Key == "KubernetesCluster" {
+			// Don't remove tag key 'KubernetesCluster' on an ELB managed outside of the controller
+			continue
+		}
+		tagKeysToRemove = append(tagKeysToRemove, tag.Key)
+	}
+	_, err := albelbv2.ELBV2svc.RemoveTags(&elbv2.RemoveTagsInput{
+		ResourceArns: []*string{lb.Current.LoadBalancerArn},
+		TagKeys: tagKeysToRemove,
+	})
+	if err != nil {
+		rOpts.Eventf(api.EventTypeWarning, "ERROR", "Error removing tag keys (%s) from load balancer (%s): %s", tagKeysToRemove, lb.Current.LoadBalancerArn , err.Error())
+		lb.logger.Errorf("Error removing tag keys (%s) from load balancer (%s): %s", tagKeysToRemove, lb.Current.LoadBalancerArn , err.Error())
+		return err
+	}
+
+	err = albelbv2.ELBV2svc.DeleteListenersForLoadBalancerArn(lb.Current.LoadBalancerArn, lb.CurrentPorts)
+	if err != nil {
+		rOpts.Eventf(api.EventTypeWarning, "ERROR", "Error deleting listeners from load balancer (%s): %s", lb.Current.LoadBalancerArn , err.Error())
+		lb.logger.Errorf("Error deleting listeners from load balancer (%s): %s", lb.Current.LoadBalancerArn , err.Error())
+		return err
+	}
+	lb.EffectivelyDeleted = true
+	return nil
 }
